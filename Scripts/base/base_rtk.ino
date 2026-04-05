@@ -25,7 +25,7 @@
 #define LORA_FIX_LENGTH_PAYLOAD_ON false
 #define LORA_IQ_INVERSION_ON       false
 #define TX_OUTPUT_POWER            14
-#define BUFFER_SIZE                255
+#define BUFFER_SIZE                512
 
 static SSD1306Wire display(0x3c, 500000, SDA_OLED, SCL_OLED, GEOMETRY_128_64, RST_OLED);
 HardwareSerial rtkSerial(2);
@@ -66,8 +66,10 @@ struct BaseState {
   double   ecefX          = 0.0;
   double   ecefY          = 0.0;
   double   ecefZ          = 0.0;
-  bool     ecefDisponivel = false;
+  bool     ecefDisponivel      = false;
+  bool     svinRespostaRecebida = false; // true apos consultarSVIN() responder
 };
+
 BaseState base;
 
 // -- Satelites SNR ----------------------------------------------------
@@ -80,6 +82,32 @@ unsigned long ultimoGSV = 0;
 static RadioEvents_t RadioEvents;
 uint8_t txBuffer[BUFFER_SIZE];
 bool loraPronto = true;
+
+// Fila de transmissao LoRa (4 slots para nao perder MSM4)
+#define LORA_QUEUE_SIZE 6
+struct LoRaPacket { uint8_t data[256]; uint16_t len; uint16_t tipo; };
+LoRaPacket loraQueue[LORA_QUEUE_SIZE];
+int loraQueueHead = 0;
+int loraQueueTail = 0;
+int loraQueueCount = 0;
+
+bool loraQueuePush(uint8_t* dados, uint16_t len, uint16_t tipo) {
+  if (loraQueueCount >= LORA_QUEUE_SIZE) return false; // fila cheia
+  memcpy(loraQueue[loraQueueTail].data, dados, len);
+  loraQueue[loraQueueTail].len  = len;
+  loraQueue[loraQueueTail].tipo = tipo;
+  loraQueueTail = (loraQueueTail + 1) % LORA_QUEUE_SIZE;
+  loraQueueCount++;
+  return true;
+}
+
+bool loraQueuePop(LoRaPacket& pkt) {
+  if (loraQueueCount == 0) return false;
+  pkt = loraQueue[loraQueueHead];
+  loraQueueHead = (loraQueueHead + 1) % LORA_QUEUE_SIZE;
+  loraQueueCount--;
+  return true;
+}
 
 // -- RTCM / NMEA buffers ----------------------------------------------
 uint8_t  rtcmBuffer[BUFFER_SIZE];
@@ -98,6 +126,9 @@ unsigned long ultimoDisplay  = 0;
 unsigned long ultimoStatus   = 0;
 unsigned long ultimoInit     = 0;
 bool          inicializado   = false;
+bool          agendarFixed   = false; // flag assincrono para ativar Fixed
+unsigned long tsAgendarFixed = 0;
+bool          aguardandoMSM4  = false; // flag para habilitar MSM4 apos Fixed confirmar
 
 // ---------------------------------------------------------------------
 void VextON(void) { pinMode(Vext, OUTPUT); digitalWrite(Vext, LOW); }
@@ -168,7 +199,7 @@ void consultarSVIN() {
 
 // Consulta estado atual do RTCM
 void consultarModoRTCM() {
-  enviarNMEA("$PAIR435"); delay(200);
+  enviarNMEA("$PAIR433"); delay(200); // GET RTCM output mode
 }
 
 // Habilita mensagens NMEA e RTCM
@@ -183,18 +214,36 @@ void habilitarNMEA() {
   logMsg("[NMEA] Sentencas habilitadas");
 }
 
-// Habilita RTCM MSM4 - chamar SOMENTE apos SVIN completar ou modo Fixed
-// O LC29H BS rejeita PAIR432 sem posicao fixada
+// Habilita conjunto RTCM otimizado para LoRa
+// Equivalente ao perfil CORS: 1074/1084/1094/1124 + 1005 + efemerides
+// Nota: LC29H BS nao suporta 1006 nem 1230 (datasheet v1.0)
+// Nota: MSM7 substituido por MSM4 (MSM7 excede 255B limite do LoRa SF7)
 void habilitarMSM4() {
-  logMsg("[RTCM] Habilitando MSM4...");
-  if (cfg.rtcmMode == 0) {
-    enviarNMEA("$PAIR432,1,1,1,1,0,0,1"); // 1074/1084/1094/1124
-  } else {
-    enviarNMEA("$PAIR432,2,2,2,2,0,0,1"); // 1077/1087/1097/1127
-  }
-  delay(300);
-  enviarNMEA("$PAIR434,1"); delay(200); // 1005 ARP
-  logMsg("[RTCM] MSM4 + 1005 enviados");
+  logMsg("[RTCM] Habilitando RTCM MSM4...");
+
+  // Datasheet LC29H BS v1.0 secao 2.3.2:
+  // PAIR432 modo padrao e -1 (desabilitado) - precisa ser enviado explicitamente
+  // Modo 0 = MSM4 (1074/1084/1094/1124)
+
+  // Desabilita primeiro para forcar reset do estado interno
+  enviarNMEA("$PAIR432,-1"); delay(300);
+
+  // Reabilita MSM4
+  enviarNMEA("$PAIR432,0");  delay(300);
+
+  // ARP 1005
+  enviarNMEA("$PAIR434,1");  delay(200);
+
+  // Efemerides
+  enviarNMEA("$PAIR436,1");  delay(200);
+
+  // Salva na NVM para persistir apos proximo reboot
+  enviarNMEA("$PQTMSAVEPAR"); delay(300);
+
+  // Consulta estado para confirmar no log
+  consultarModoRTCM();
+
+  logMsg("[RTCM] PAIR432=MSM4 PAIR434=ARP PAIR436=EPH configurados");
 }
 
 // Mantida por compatibilidade com chamadas existentes
@@ -205,15 +254,20 @@ void habilitarRTCM() {
 // Secao 2.2.1: PQTMCFGSVIN - Survey-in ou Fixed
 // ATENCAO: MinDur = numero de AMOSTRAS (nao segundos!) que atingem AccLimit
 // AccLimit = precisao maxima em METROS por amostra
-// Fonte: https://indystry.cc/how-to-use-lc29h-the-cheapest-gps-rtk-module/
 void ativarSVIN() {
   String cmd;
   if (cfg.svinMode == 1) {
     // Survey-in: $PQTMCFGSVIN,W,1,<MinDur>,<3D_AccLimit>,<ECEF_X>,<ECEF_Y>,<ECEF_Z>
     // Datasheet: campos ECEF obrigatorios - usar 0,0,0 no modo Survey-in
+    // MinDur=0 e AccLimit=0 = SVIN continuo sem limite
+    // O modulo gera RTCM MSM4 enquanto o SVIN esta ativo
+    // Nunca "completa" - continua refinando a posicao indefinidamente
+    // Guia oficial: $PQTMCFGSVIN,W,1,3600,15,0,0,0
+    // 3600 = numero de amostras que devem atingir AccLimit
+    // 15.0 = limite de precisao em metros por amostra
     cmd = "$PQTMCFGSVIN,W,1,"
           + String(cfg.svinMinDur) + ","
-          + String((int)cfg.svinAccLimit)  // sem casas decimais
+          + String((int)cfg.svinAccLimit)
           + ",0,0,0";
   } else {
     // Fixed mode: requer coordenadas ECEF reais
@@ -272,20 +326,17 @@ void ativarModoFixed() {
 
   logMsg("[FIXED] Enviando: " + String(cmd));
   enviarNMEA(String(cmd));
-  delay(300);
-
-  // Salva na NVM - o ACK chega pelo processarNMEA no loop principal
+  // Sem delay - BLE precisa continuar respondendo
+  // PQTMSAVEPAR enviado logo em seguida
   enviarNMEA("$PQTMSAVEPAR");
-  delay(300);
   cfg.svinMode = 2;
-  logMsg("[FIXED] Modo Fixed enviado - aguardando confirmacao...");
   logMsg("[FIXED] X=" + String(base.ecefX, 4)
        + " Y=" + String(base.ecefY, 4)
        + " Z=" + String(base.ecefZ, 4));
-
-  // Aguarda 1s para o modulo processar e habilita MSM4
-  delay(1000);
-  habilitarMSM4();
+  logMsg("[FIXED] Aguardando modulo aplicar Fixed (sem reboot)...");
+  // Aguarda 5s para o modulo processar Fixed internamente
+  // depois habilita MSM4
+  aguardandoMSM4 = true;
 }
 
 // -- Aplicar config via BLE --------------------------------------------
@@ -320,14 +371,9 @@ void aplicarConfig(String json) {
   if (doc.containsKey("voltarSVIN") && doc["voltarSVIN"] == true) {
     logMsg("[SVIN] Reiniciando Survey-in...");
     // Primeiro desabilita o modo Fixed/SVIN atual
-    enviarNMEA("$PQTMCFGSVIN,W,0,0,0,0,0,0"); // Modo 0 = desabilita
-    delay(500);
-    // Restaura parametros padrao
+    enviarNMEA("$PQTMCFGSVIN,W,0,0,0,0,0,0");
     enviarNMEA("$PQTMRESTOREPAR");
-    delay(1000);
-    // Reabilita apenas NMEA (MSM4 sera reabilitado apos SVIN completar)
     habilitarNMEA();
-    delay(300);
     // Inicia novo SVIN
     cfg.svinMode      = 1;
     base.svinCompleto = false;
@@ -626,11 +672,47 @@ void processarNMEA(String linha) {
         logMsg("[SVIN] Modo=" + modoStr
                + " MinDur=" + String(dur) + "s"
                + " AccLimit=" + String(acc, 2) + "m");
-        // Atualiza config local com valores reais do modulo
+        // Resposta recebida - agora e seguro decidir se inicia SVIN
+        base.svinRespostaRecebida = true;
+        // Atualiza config local
         cfg.svinMode     = modo;
         cfg.svinMinDur   = dur;
         cfg.svinAccLimit = acc;
-        if (modo == 1 || modo == 2) base.svinAtivo = true;
+        // Se Fixed, extrai ECEF dos campos (c[5]=X, c[6]=Y, c[7]=Z)
+        if (modo == 2 && c[5].length() > 0) {
+          double ecefX = c[5].toDouble();
+          double ecefY = c[6].toDouble();
+          String ecefZStr = c[7];
+          int sp = ecefZStr.indexOf('*');
+          if (sp >= 0) ecefZStr = ecefZStr.substring(0, sp);
+          double ecefZ = ecefZStr.toDouble();
+          if (abs(ecefX) > 1000.0) {
+            base.ecefX = ecefX;
+            base.ecefY = ecefY;
+            base.ecefZ = ecefZ;
+            base.ecefDisponivel = true;
+            double lat, lon, alt;
+            ecefParaLatLon(ecefX, ecefY, ecefZ, lat, lon, alt);
+            base.lat = (float)lat;
+            base.lon = (float)lon;
+            base.alt = (float)alt;
+            logMsg("[FIXED] Posicao: " + String(lat, 7)
+                   + ", " + String(lon, 7)
+                   + " Alt:" + String(alt, 1) + "m");
+          }
+        }
+        if (modo == 2) {
+          // Modulo ja esta em modo Fixed (salvo na NVM)
+          base.svinCompleto = true;
+          base.svinAtivo    = false;
+          base.svinPct      = 100;
+          logMsg("[FIXED] Modulo ja em modo Fixed - transmissao ativa!");
+          // Le coordenadas ECEF do modulo para calcular lat/lon
+          enviarNMEA("$PQTMCFGSVIN,R");
+          aguardandoMSM4 = true;
+        } else if (modo == 1) {
+          base.svinAtivo = true;
+        }
       } else {
         // Resposta simples do SET
         logMsg("[SVIN] Comando aceito!");
@@ -667,9 +749,10 @@ void processarNMEA(String linha) {
       base.svinAccM = epeH;
 
       // Calcula progresso baseado no EPE_H convergindo para o alvo
-      if (cfg.svinAccLimit > 0 && epeH > 0) {
-        float accInicial = 200.0; // EPE inicial tipico ~200m
-        float progresso  = (accInicial - epeH) / (accInicial - cfg.svinAccLimit);
+      if (epeH > 0) {
+        float limEfetivo = (cfg.svinAccLimit > 0) ? cfg.svinAccLimit : 15.0;
+        float accInicial = 200.0;
+        float progresso  = (accInicial - epeH) / (accInicial - limEfetivo);
         base.svinPct = (uint8_t)(constrain(progresso * 100.0, 0.0, 99.0));
       }
 
@@ -679,7 +762,9 @@ void processarNMEA(String linha) {
       }
 
       // SVIN completo quando EPE_H <= alvo configurado
-      if (epeH <= cfg.svinAccLimit && !base.svinCompleto && base.svinAtivo) {
+      // Se AccLimit foi zerado no modulo, usa o valor do app (15m default)
+      float limiteEfetivo = (cfg.svinAccLimit > 0) ? cfg.svinAccLimit : 15.0;
+      if (epeH <= limiteEfetivo && !base.svinCompleto && base.svinAtivo) {
         base.svinCompleto = true; // marca ANTES para nao repetir
         base.svinAtivo    = false;
         base.svinPct      = 100;
@@ -689,11 +774,10 @@ void processarNMEA(String linha) {
           latLonAltParaECEF(base.lat, base.lon, base.alt,
                             base.ecefX, base.ecefY, base.ecefZ);
           base.ecefDisponivel = true;
-          // Ativa modo Fixed automaticamente com as coordenadas calculadas
-          // Fixed mantem o modulo em modo base gerando MSM4 continuamente
-          logMsg("[SVIN] Ativando modo Fixed automaticamente...");
-          delay(500);
-          ativarModoFixed();
+          // Ativa Fixed imediatamente - ESP32 vai reiniciar apos salvar
+          logMsg("[SVIN] Ativando Fixed automaticamente...");
+          agendarFixed   = true;
+          tsAgendarFixed = millis() + 1000;
           logMsg("[ECEF] X=" + String(base.ecefX, 4)
                + " Y=" + String(base.ecefY, 4)
                + " Z=" + String(base.ecefZ, 4));
@@ -837,7 +921,27 @@ void processarNMEA(String linha) {
 
 // -- RTCM via LoRa ----------------------------------------------------
 void enviarRTCMLoRa(uint8_t* dados, uint16_t len) {
-  if (len == 0 || len > BUFFER_SIZE) return;
+  if (len == 0) return;
+
+  // So transmite MSM4 quando Fixed confirmado
+  // Durante SVIN o modulo gera apenas 1005 (sem MSM4)
+  if (!base.svinCompleto) return;
+
+  if (len > 255) {
+    // LoRa SF7 BW125 max payload = 255 bytes
+    // Mensagem muito grande para LoRa - descarta
+    uint16_t tipo = 0;
+    if (len >= 5) {
+      tipo = ((uint16_t)(dados[3] & 0xFF) << 4) | ((uint16_t)(dados[4] & 0xF0) >> 4);
+    }
+    String descMSM = "";
+    if (tipo == 1077) descMSM = " (GPS MSM7 - use MSM4)";
+    else if (tipo == 1087) descMSM = " (GLO MSM7 - use MSM4)";
+    else if (tipo == 1097) descMSM = " (GAL MSM7 - use MSM4)";
+    else if (tipo == 1127) descMSM = " (BDS MSM7 - use MSM4)";
+    logMsg("[LORA] DESCARTADO " + String(tipo) + descMSM + " " + String(len) + "B>255B");
+    return;
+  }
 
   // Timeout de seguranca: se loraPronto travou, reseta apos 3s
   static unsigned long ultimoTx = 0;
@@ -849,22 +953,51 @@ void enviarRTCMLoRa(uint8_t* dados, uint16_t len) {
     loraPronto = true;
   }
 
-  if (!loraPronto) return; // ainda aguardando TX anterior
-
-  // Extrai tipo da mensagem RTCM para log
+  // Extrai tipo
   uint16_t tipo = 0;
-  if (len >= 4) {
+  if (len >= 5) {
     tipo = ((uint16_t)(dados[3] & 0xFF) << 4) | ((uint16_t)(dados[4] & 0xF0) >> 4);
   }
 
-  loraPronto = false;
-  ultimoTx   = millis();
-  memcpy(txBuffer, dados, len);
-  Radio.Send(txBuffer, len);
-  base.rtcmEnviados++;
-  base.bytesEnviados += len;
-  base.ultimoEnvio    = millis();
-  logMsg("[LORA] TX tipo:" + String(tipo) + " " + String(len) + "B msg#" + String(base.rtcmEnviados));
+  if (loraPronto) {
+    // Transmite imediatamente
+    loraPronto = false;
+    ultimoTx   = millis();
+    memcpy(txBuffer, dados, len);
+    Radio.Send(txBuffer, len);
+    base.rtcmEnviados++;
+    base.bytesEnviados += len;
+    base.ultimoEnvio    = millis();
+    logMsg("[LORA] TX tipo:" + String(tipo) + " " + String(len) + "B msg#" + String(base.rtcmEnviados));
+  } else {
+    // Coloca na fila - prioriza MSM4 sobre efemerides
+    bool isMSM4 = (tipo==1074||tipo==1084||tipo==1094||tipo==1124||tipo==1005);
+    if (isMSM4 || loraQueueCount < LORA_QUEUE_SIZE) {
+      if (!loraQueuePush(dados, len, tipo)) {
+        // Fila cheia - descarta efemerides para dar espaco ao MSM4
+        if (isMSM4) {
+          loraQueueHead = (loraQueueHead + 1) % LORA_QUEUE_SIZE;
+          loraQueueCount--;
+          loraQueuePush(dados, len, tipo);
+        }
+      }
+    }
+  }
+}
+
+// Processa proximo item da fila quando radio esta livre
+void processarFilaLoRa() {
+  if (!loraPronto || loraQueueCount == 0) return;
+  LoRaPacket pkt;
+  if (loraQueuePop(pkt)) {
+    loraPronto = false;
+    memcpy(txBuffer, pkt.data, pkt.len);
+    Radio.Send(txBuffer, pkt.len);
+    base.rtcmEnviados++;
+    base.bytesEnviados += pkt.len;
+    base.ultimoEnvio    = millis();
+    logMsg("[LORA] TX tipo:" + String(pkt.tipo) + " " + String(pkt.len) + "B msg#" + String(base.rtcmEnviados));
+  }
 }
 
 void processarByteRTCM(uint8_t b) {
@@ -882,18 +1015,33 @@ void processarByteRTCM(uint8_t b) {
       rtcmEsperado = (((uint16_t)(rtcmBuffer[1] & 0x03)) << 8 | rtcmBuffer[2]) + 6;
       // Sanidade: mensagem RTCM valida tem entre 6 e 255 bytes
       if (rtcmEsperado < 6 || rtcmEsperado > BUFFER_SIZE) {
+        uint16_t tipo = 0;
+        if (rtcmLen >= 5) {
+          tipo = ((uint16_t)(rtcmBuffer[3] & 0xFF) << 4) | ((uint16_t)(rtcmBuffer[4] & 0xF0) >> 4);
+        }
+        logMsg("[RTCM] DESCARTADO tipo:" + String(tipo) + " tam:" + String(rtcmEsperado) + "B (limite:" + String(BUFFER_SIZE) + ")");
         coletandoRTCM = false; rtcmLen = 0; rtcmEsperado = 0;
         return;
       }
     }
     if (rtcmLen >= 3 && rtcmEsperado > 0 && rtcmLen == rtcmEsperado) {
-      // Transmite sempre - base gera RTCM mesmo durante SVIN
+      // Log de todos os tipos recebidos para diagnostico
+      uint16_t tipoDbg = 0;
+      if (rtcmLen >= 5) {
+        tipoDbg = ((uint16_t)(rtcmBuffer[3] & 0xFF) << 4) |
+                  ((uint16_t)(rtcmBuffer[4] & 0xF0) >> 4);
+      }
+      static uint16_t ultimoTipoDbg = 0;
+      if (tipoDbg != ultimoTipoDbg) {
+        logMsg("[RTCM] Recebido tipo:" + String(tipoDbg) + " " + String(rtcmLen) + "B");
+        ultimoTipoDbg = tipoDbg;
+      }
       enviarRTCMLoRa(rtcmBuffer, rtcmLen);
       coletandoRTCM = false; rtcmLen = 0; rtcmEsperado = 0;
     }
     // Reseta se buffer cheio (mensagem corrompida)
     if (rtcmLen >= BUFFER_SIZE) {
-      logMsg("[LORA] AVISO: buffer RTCM cheio - descartando");
+      logMsg("[LORA] AVISO: buffer cheio " + String(rtcmLen) + "B > " + String(BUFFER_SIZE) + "B - descartando");
       coletandoRTCM = false; rtcmLen = 0; rtcmEsperado = 0;
     }
   }
@@ -939,6 +1087,15 @@ void loop() {
   while (rtkSerial.available()) {
     uint8_t b = rtkSerial.read();
     if (b == 0xD3 || coletandoRTCM) {
+      // Conta pacotes RTCM recebidos do modulo (diagnostico)
+      static uint32_t rtcmDoModulo = 0;
+      if (b == 0xD3 && !coletandoRTCM) {
+        rtcmDoModulo++;
+        // Loga a cada 10 pacotes para nao poluir
+        if (rtcmDoModulo % 10 == 1) {
+          logMsg("[DIAG] Modulo gerando RTCM #" + String(rtcmDoModulo));
+        }
+      }
       processarByteRTCM(b);
     } else {
       if (b == '\n') {
@@ -951,28 +1108,97 @@ void loop() {
     }
   }
 
-  // Inicializa modulo 3s apos boot - garante UART estavel e respostas capturadas
-  if (!inicializado && millis() > 3000) {
+  // Inicializa modulo 3s apos boot
+  // Aguarda 8s para o modulo LC29H estabilizar apos power-on/reboot
+  // O modulo precisa de tempo para carregar configuracoes da NVM
+  if (!inicializado && millis() > 8000) {
     inicializado = true;
-    logMsg("[INIT] Configurando modulo LC29H...");
+    logMsg("[INIT] Configurando modulo LC29H BS...");
     consultarFirmware(); delay(500);
-    // PQTMRESTOREPAR removido - apagaria o modo Fixed salvo na NVM
-    consultarSVIN();     delay(500);
-    // habilitarNMEA removida - consolidada em habilitarRTCM     delay(500);
-    habilitarRTCM();     delay(500);
+    habilitarNMEA();     delay(300);
+
+    // Habilita RTCM (salvo na NVM persiste, mas reenvia por seguranca)
+    enviarNMEA("$PAIR432,0");  delay(300);
+    enviarNMEA("$PAIR434,1");  delay(200);
+    enviarNMEA("$PAIR436,1");  delay(200);
+    enviarNMEA("$PQTMSAVEPAR"); delay(300);
+
+    // Consulta modo SVIN - aguarda resposta antes de iniciar SVIN
+    consultarSVIN();
+    consultarModoRTCM();
+  }
+
+  // Inicia SVIN apenas se necessario E apos confirmacao do modulo
+  // svinRespostaRecebida garante que consultarSVIN() respondeu antes de agir
+  static bool svinIniciado = false;
+  if (inicializado && !svinIniciado && !base.svinCompleto
+      && cfg.svinMode == 1 && base.svinRespostaRecebida
+      && millis() > 10000) {
+    svinIniciado = true;
     ativarSVIN();
   }
 
   Radio.IrqProcess();
+  processarFilaLoRa();
+
+  // Processa Fixed agendado (assincrono - nao bloqueia BLE)
+  if (agendarFixed && millis() >= tsAgendarFixed) {
+    agendarFixed = false;
+    ativarModoFixed();
+  }
+
+
+  // Habilita MSM4 apos Fixed confirmado
+  // Aguarda 5s para modulo estabilizar apos boot em Fixed
+  static unsigned long tsMSM4 = 0;
+  if (aguardandoMSM4 && tsMSM4 == 0) tsMSM4 = millis() + 8000;
+  if (aguardandoMSM4 && tsMSM4 > 0 && millis() >= tsMSM4) {
+    aguardandoMSM4 = false;
+    tsMSM4 = 0;
+    habilitarMSM4();
+  }
 
   if (millis() - ultimoDisplay > 1000) { atualizarDisplay(); ultimoDisplay = millis(); }
   if (millis() - ultimoStatus  > 3000) { enviarStatusBLE();  ultimoStatus  = millis(); }
+
+  // Verifica saude do modulo: sem PQTMEPE em 30s = problema
+  static unsigned long ultimoPQTMEPE = 0;
+  if (base.svinAccM > 0) ultimoPQTMEPE = millis();
+  if (inicializado && ultimoPQTMEPE > 0 && millis() - ultimoPQTMEPE > 30000) {
+    logMsg("[WARN] Sem PQTMEPE em 30s - modulo pode estar sem sinal GPS");
+    ultimoPQTMEPE = millis(); // reseta para nao repetir todo segundo
+  }
+
+  // Diagnostico periodico e reenvio PAIR432 se necessario
+  static unsigned long ultimoMSM4check = 0;
+  static uint32_t      ultimoEnvCheck  = 0;
+  if (cfg.svinMode == 2 && base.svinCompleto
+      && millis() - ultimoMSM4check > 20000) {
+    ultimoMSM4check = millis();
+
+    // Consulta modo RTCM atual para ver no log
+    consultarModoRTCM();
+    enviarNMEA("$PAIR435"); // consulta ARP
+
+    if (base.rtcmEnviados == ultimoEnvCheck) {
+      // Nao transmitiu nada novo - reenvia configuracao completa
+      logMsg("[RTCM] Sem transmissao em 20s - reabilitando...");
+      enviarNMEA("$PAIR432,-1"); delay(200);
+      enviarNMEA("$PAIR432,0");  delay(200);
+      enviarNMEA("$PAIR434,1");  delay(200);
+      enviarNMEA("$PAIR436,1");  delay(200);
+      enviarNMEA("$PQTMSAVEPAR");
+    } else {
+      logMsg("[RTCM] OK - enviados:" + String(base.rtcmEnviados)
+             + " bytes:" + String(base.bytesEnviados));
+    }
+    ultimoEnvCheck = base.rtcmEnviados;
+  }
 
   // Envia SNR dedicado a cada 5s se ha dados de satelites recentes
   static unsigned long ultimoSNR = 0;
   if (bleConectado && millis() - ultimoGSV < 8000 && millis() - ultimoSNR > 5000) {
     ultimoSNR = millis();
-    delay(150);
     StaticJsonDocument<1024> snrDoc;
     JsonArray arr = snrDoc.createNestedArray("snr");
     for (int i = 0; i < MAX_SATS; i++) {

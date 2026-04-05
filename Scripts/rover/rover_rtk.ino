@@ -12,6 +12,17 @@
 #define RX_PIN 48
 #define TX_PIN 47
 
+// -- LED RGB catodo comum (HIGH=acende) -------------------------
+// Pinos ajustados conforme ligacao fisica real
+#define LED_R_PIN 7
+#define LED_G_PIN 6
+#define LED_B_PIN 5
+
+enum LedEstado { LED_SEM_GPS, LED_RTK_FLOAT, LED_RTK_FIXED };
+LedEstado     ledEstado = LED_SEM_GPS;
+unsigned long tLed      = 0;
+bool          ledOn     = false;
+
 // -- BLE UUIDs -------------------------------------------------
 #define BLE_SERVICE_UUID     "12345678-1234-1234-1234-123456789abc"
 #define BLE_CHAR_CONFIG_UUID "12345678-1234-1234-1234-123456789001"
@@ -28,7 +39,7 @@
 #define LORA_FIX_LENGTH_PAYLOAD_ON false
 #define LORA_IQ_INVERSION_ON      false
 #define TX_OUTPUT_POWER           14
-#define BUFFER_SIZE               255
+#define BUFFER_SIZE               512
 
 static SSD1306Wire display(0x3c, 500000, SDA_OLED, SCL_OLED, GEOMETRY_128_64, RST_OLED);
 HardwareSerial rtkSerial(2);
@@ -42,6 +53,9 @@ struct RoverState {
   float    epeH         = 0.0;
   int      fixQuality   = 0;   // 0=no fix,1=GPS,2=DGPS,4=RTK Fixed,5=RTK Float
   uint32_t rtcmRecv     = 0;   // mensagens RTCM recebidas via LoRa
+  double   baseLat      = 0.0; // posicao da base (do pacote RTCM 1005)
+  double   baseLon      = 0.0;
+  float    baseAlt      = 0.0;
   uint32_t bytesRecv    = 0;
   unsigned long ultimoRTCM = 0;
   String   firmware     = "";
@@ -76,6 +90,35 @@ bool inicializado = false;
 // -------------------------------------------------------------
 void VextON(void) { pinMode(Vext, OUTPUT); digitalWrite(Vext, LOW); }
 
+// -- LED RGB --------------------------------------------------
+void ledRGB(bool r, bool g, bool b) {
+  digitalWrite(LED_R_PIN, r);
+  digitalWrite(LED_G_PIN, g);
+  digitalWrite(LED_B_PIN, b);
+}
+
+void atualizarLED() {
+  switch (ledEstado) {
+    case LED_SEM_GPS:
+      ledRGB(true, false, false);   // vermelho fixo
+      break;
+    case LED_RTK_FLOAT:
+      ledRGB(true, true, false);    // laranja fixo (R+G)
+      break;
+    case LED_RTK_FIXED:
+      ledRGB(false, true, false);   // verde fixo
+      break;
+  }
+}
+
+void atualizarEstadoLED() {
+  switch (rover.fixQuality) {
+    case 4:  ledEstado = LED_RTK_FIXED; break;
+    case 5:  ledEstado = LED_RTK_FLOAT; break;
+    default: ledEstado = LED_SEM_GPS;   break;
+  }
+}
+
 // -- Log -------------------------------------------------------
 void logMsg(String msg) {
   Serial.println(msg);
@@ -89,6 +132,34 @@ void logMsg(String msg) {
 // -- Callbacks LoRa --------------------------------------------
 // Flag de controle RX - padrao oficial Heltec
 bool loraIdle = true;
+
+void ecefParaLatLon(double x, double y, double z,
+                    double &lat, double &lon, double &alt) {
+  const double a  = 6378137.0;
+  const double e2 = 6.6943799901e-3;
+  lon = atan2(y, x);
+  double p   = sqrt(x*x + y*y);
+  double phi = atan2(z, p * (1.0 - e2));
+  for (int i = 0; i < 10; i++) {
+    double N = a / sqrt(1.0 - e2 * sin(phi) * sin(phi));
+    phi = atan2(z + e2 * N * sin(phi), p);
+  }
+  double N = a / sqrt(1.0 - e2 * sin(phi) * sin(phi));
+  alt = p / cos(phi) - N;
+  lat = phi * 180.0 / M_PI;
+  lon = lon * 180.0 / M_PI;
+}
+
+double extrairECEF(uint8_t* buf, int bitOffset) {
+  int64_t val = 0;
+  for (int i = 0; i < 38; i++) {
+    int byteIdx = (bitOffset + i) / 8;
+    int bitIdx  = 7 - ((bitOffset + i) % 8);
+    if ((buf[byteIdx] >> bitIdx) & 1) val |= ((int64_t)1 << (37 - i));
+  }
+  if (val & ((int64_t)1 << 37)) val |= ~(((int64_t)1 << 38) - 1);
+  return (double)val * 0.0001;
+}
 
 void OnRxDone(uint8_t* payload, uint16_t size, int16_t rssi, int8_t snrVal) {
   if (size > 0 && payload[0] == 0xD3) {
@@ -104,10 +175,53 @@ void OnRxDone(uint8_t* payload, uint16_t size, int16_t rssi, int8_t snrVal) {
       tipo = ((uint16_t)(payload[3] & 0xFF) << 4) |
              ((uint16_t)(payload[4] & 0xF0) >> 4);
     }
-    logMsg("[RTCM] " + String(tipo)
-           + " " + String(size) + "B"
-           + " RSSI:" + String(rssi)
-           + " #" + String(rover.rtcmRecv));
+    // Classifica e loga tipo RTCM
+    String tipoNome = String(tipo);
+    if      (tipo == 1005 || tipo == 1006) {
+      tipoNome += "(ARP)";
+      // Parseia posicao ECEF da base (RTCM 1005)
+      // payload inclui header 0xD3+len(2) = 24 bits antes do payload RTCM
+      // offsets reais: X=34+24=58, Y=74+24=98, Z=114+24=138
+      if (size >= 22) {
+        double ex = extrairECEF(payload, 58);
+        double ey = extrairECEF(payload, 98);
+        double ez = extrairECEF(payload, 138);
+        if (abs(ex) > 1000.0) {
+          double lat, lon, alt;
+          ecefParaLatLon(ex, ey, ez, lat, lon, alt);
+          rover.baseLat = lat;
+          rover.baseLon = lon;
+          rover.baseAlt = (float)alt;
+        }
+      }
+    }
+    else if (tipo == 1074)  tipoNome += "(GPS-MSM4)";
+    else if (tipo == 1084)  tipoNome += "(GLO-MSM4)";
+    else if (tipo == 1094)  tipoNome += "(GAL-MSM4)";
+    else if (tipo == 1124)  tipoNome += "(BDS-MSM4)";
+    else if (tipo == 1006)  tipoNome += "(ARP+alt)";
+    else if (tipo == 1019)  tipoNome += "(EPH-GPS)";
+    else if (tipo == 1020)  tipoNome += "(EPH-GLO)";
+    else if (tipo == 1042)  tipoNome += "(EPH-BDS)";
+    else if (tipo == 1045 || tipo == 1046) tipoNome += "(EPH-GAL)";
+    else if (tipo == 1230)  tipoNome += "(GLO-bias)";
+
+    // Loga cada tipo novo e periodicamente
+    static uint16_t tiposVistos[20] = {0};
+    static uint8_t  nTipos = 0;
+    bool tipoNovo = true;
+    for (int i = 0; i < nTipos; i++) {
+      if (tiposVistos[i] == tipo) { tipoNovo = false; break; }
+    }
+    if (tipoNovo && nTipos < 20) tiposVistos[nTipos++] = tipo;
+
+    // Loga tipo novo sempre, outros a cada 100 msgs
+    if (tipoNovo || rover.rtcmRecv % 100 == 0) {
+      logMsg("[RTCM] " + tipoNome
+             + " " + String(size) + "B"
+             + " RSSI:" + String(rssi)
+             + " #" + String(rover.rtcmRecv));
+    }
   } else if (size > 0) {
     // Nao e RTCM - loga primeiro byte para diagnostico
     logMsg("[LORA] nao-RTCM 0x" + String(payload[0], HEX)
@@ -153,16 +267,29 @@ void consultarFirmware() {
 }
 
 void configurarRover() {
-  // Habilita NMEA necessario
-  enviarNMEA("$PAIR062,3,1"); delay(200); // GGA - posicao + fix quality
-  enviarNMEA("$PAIR062,0,1"); delay(200); // GLL - lat/lon
-  enviarNMEA("$PAIR062,1,1"); delay(200); // RMC - posicao + data
-  enviarNMEA("$PAIR062,4,1"); delay(200); // GSA - satelites em uso
-  enviarNMEA("$PAIR062,5,1"); delay(200); // GSV - SNR satelites
+  logMsg("[ROVER] Configurando modulo LC29H DA...");
 
-  // Habilita EPE (precisao estimada) - essencial para mostrar qualidade RTK
-  enviarNMEA("$PAIR430,1");   delay(200); // habilita PQTMEPE a 1Hz
-  logMsg("[ROVER] NMEA + EPE habilitados");
+  // Habilita NMEA
+  enviarNMEA("$PAIR062,3,1"); delay(200); // GGA
+  enviarNMEA("$PAIR062,0,1"); delay(200); // GLL
+  enviarNMEA("$PAIR062,1,1"); delay(200); // RMC
+  enviarNMEA("$PAIR062,4,1"); delay(200); // GSA
+  enviarNMEA("$PAIR062,5,1"); delay(200); // GSV
+
+  // Habilita PQTMEPE
+  // LC29H DA usa PQTMCFGEPE (diferente do BS que usa PAIR430)
+  enviarNMEA("$PQTMCFGEPE,W,1"); delay(300); // habilita EPE
+  enviarNMEA("$PQTMCFGEPE,R");   delay(200); // le config para confirmar
+  // Tenta tambem PAIR430 como fallback
+  enviarNMEA("$PAIR430,1");       delay(200);
+
+  // Modo rover explicito
+  enviarNMEA("$PQTMCFGRCVRMODE,W,1"); delay(300);
+
+  // Salva
+  enviarNMEA("$PQTMSAVEPAR"); delay(300);
+
+  logMsg("[ROVER] Configurado - aguardando PQTMEPE...");
 }
 
 // -- Status JSON via BLE ----------------------------------------
@@ -174,11 +301,16 @@ void enviarStatusBLE() {
   doc["lon"]        = serialized(String(rover.lon, 7));
   doc["alt"]        = serialized(String(rover.alt, 2));
   doc["sats"]       = rover.satelites;
-  doc["svinAccM"]   = serialized(String(rover.epeH, 3));
+  doc["epeH"]       = serialized(String(rover.epeH, 3));
   doc["fixQuality"] = rover.fixQuality;
   doc["rtcmRecv"]   = rover.rtcmRecv;
   doc["bytesRecv"]  = rover.bytesRecv;
   doc["firmware"]   = rover.firmware;
+  if (rover.baseLat != 0.0) {
+    doc["baseLat"] = serialized(String(rover.baseLat, 7));
+    doc["baseLon"] = serialized(String(rover.baseLon, 7));
+    doc["baseAlt"] = serialized(String(rover.baseAlt, 2));
+  }
 
   // Tempo desde ultimo RTCM recebido
   if (rover.ultimoRTCM > 0) {
@@ -378,6 +510,24 @@ void processarNMEA(String linha) {
     if (count > 0) rover.satelites = count;
   }
 
+  // PAIR431 - resposta GET EPE config (BS)
+  if (linha.startsWith("$PAIR431,")) {
+    String c[3]; splitCSV(linha, c, 3);
+    String en = c[1];
+    int sp = en.indexOf('*'); if (sp >= 0) en = en.substring(0, sp);
+    en.trim();
+    logMsg("[EPE] PAIR431: " + String(en == "1" ? "HABILITADO" : "DESABILITADO"));
+  }
+
+  // PQTMCFGEPE - resposta GET EPE config (DA)
+  if (linha.startsWith("$PQTMCFGEPE,") && linha.indexOf(",OK") >= 0) {
+    String c[4]; splitCSV(linha, c, 4);
+    String en = c[2];
+    int sp = en.indexOf('*'); if (sp >= 0) en = en.substring(0, sp);
+    en.trim();
+    logMsg("[EPE] PQTMCFGEPE: " + String(en == "1" ? "HABILITADO" : "DESABILITADO") + " en=" + en);
+  }
+
   // PQTMEPE - precisao estimada
   if (linha.startsWith("$PQTMEPE")) {
     String c[8]; splitCSV(linha, c, 8);
@@ -445,6 +595,12 @@ void setup() {
   Serial.begin(115200);
   Serial.println("=== ROVER RTK iniciando ===");
   Mcu.begin(HELTEC_BOARD, SLOW_CLK_TPYE);
+
+  // LED RGB
+  pinMode(LED_R_PIN, OUTPUT);
+  pinMode(LED_G_PIN, OUTPUT);
+  pinMode(LED_B_PIN, OUTPUT);
+  ledRGB(false, false, false);
 
   display.init();
   display.setFont(ArialMT_Plain_10);
@@ -522,11 +678,14 @@ void loop() {
     ultimoDisplay = millis();
   }
 
-  // Status BLE: 3s
   if (millis() - ultimoStatus > 3000) {
     enviarStatusBLE();
     ultimoStatus = millis();
   }
+
+  // LED RGB
+  atualizarEstadoLED();
+  atualizarLED();
 
   // Diagnostico LoRa: loga estado a cada 10s
   static unsigned long ultimoDiag = 0;
